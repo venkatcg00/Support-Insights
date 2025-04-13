@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Script: setup_project.sh
+# Script: deploy.sh
 # Description: Initializes and monitors a Docker Compose-based data pipeline with Airflow, Kafka,
 #              MySQL, MongoDB, MinIO, and other services. Ensures idempotency for safe re-runs.
-# Author: [Your Name]
+# Author: Venkat CG
 # Date: April 13, 2025
 # Usage: ./setup_project.sh
 # Prerequisites:
