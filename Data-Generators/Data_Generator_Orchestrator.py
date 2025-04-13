@@ -1,13 +1,14 @@
-"""Parent script to orchestrate execution of data generator scripts at random intervals.
+"""
+Parent script to orchestrate execution of data generator scripts with manual control.
 
-This script runs CSV_Data_Generator.py, JSON_Data_Generator.py, and XML_Data_Generator.py
-asynchronously with random natural number inputs and random delays between executions.
-It exposes an HTTP server on port 1212 with a web interface resembling an Informatica Workflow Monitor,
+This script runs an HTTP server on port 1212 with a web interface resembling an Informatica Workflow Monitor,
 showing script status, run details, countdown to next run, and links to download log files.
+Each script (CSV_Data_Generator.py, JSON_Data_Generator.py, XML_Data_Generator.py) has a start/stop toggle button.
+When started, scripts run asynchronously with random inputs and delays. When stopped, execution halts.
 
 Example (run inside python-runner container):
     $ python /app/scripts/Data_Generator_Orchestrator.py
-    # Starts the orchestrator and HTTP server.
+    # Starts the HTTP server.
     # Access monitor: http://localhost:1212/
 """
 
@@ -41,33 +42,39 @@ script_status: Dict[str, Dict[str, Any]] = {
     "CSV_Data_Generator": {
         "last_run": None,
         "last_input": None,
-        "status": "Idle",
+        "status": "Stopped",
         "last_error": None,
         "last_log_file": None,
         "last_duration": None,  # Duration in seconds
-        "next_run": None        # Timestamp of next scheduled run
+        "next_run": None,       # Timestamp of next scheduled run
+        "running": False,       # Tracks if the script is actively running
+        "task": None            # Stores asyncio Task for cancellation
     },
     "JSON_Data_Generator": {
         "last_run": None,
         "last_input": None,
-        "status": "Idle",
+        "status": "Stopped",
         "last_error": None,
         "last_log_file": None,
         "last_duration": None,
-        "next_run": None
+        "next_run": None,
+        "running": False,
+        "task": None
     },
     "XML_Data_Generator": {
         "last_run": None,
         "last_input": None,
-        "status": "Idle",
+        "status": "Stopped",
         "last_error": None,
         "last_log_file": None,
         "last_duration": None,
-        "next_run": None
+        "next_run": None,
+        "running": False,
+        "task": None
     }
 }
 
-# HTML template with refresh button and countdown timer
+# HTML template with escaped curly braces and start/stop toggle buttons
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -110,7 +117,7 @@ HTML_TEMPLATE = """
         .status-running {{ color: #FFA500; }}
         .status-completed {{ color: #008000; }}
         .status-failed {{ color: #FF0000; }}
-        .status-idle {{ color: #808080; }}
+        .status-stopped {{ color: #808080; }}
         a {{
             color: #0066cc;
             text-decoration: none;
@@ -118,27 +125,32 @@ HTML_TEMPLATE = """
         a:hover {{
             text-decoration: underline;
         }}
-        .refresh-btn {{
-            margin: 10px auto;
-            display: block;
-            padding: 10px 20px;
-            background-color: #4CAF50;
-            color: white;
+        .toggle-btn {{
+            padding: 5px 10px;
             border: none;
             cursor: pointer;
-            font-size: 16px;
+            font-size: 14px;
+            border-radius: 4px;
         }}
-        .refresh-btn:hover {{
-            background-color: #45a049;
+        .start-btn {{
+            background-color: #4CAF50;
+            color: white;
+        }}
+        .stop-btn {{
+            background-color: #FF0000;
+            color: white;
+        }}
+        .toggle-btn:hover {{
+            opacity: 0.9;
         }}
     </style>
 </head>
 <body>
     <h1>Data Generator Workflow Monitor</h1>
-    <button class="refresh-btn" onclick="location.reload()">Refresh</button>
     <table>
         <tr>
             <th>Script Name</th>
+            <th>Control</th>
             <th>Status</th>
             <th>Last Run</th>
             <th>Last Input</th>
@@ -162,6 +174,15 @@ HTML_TEMPLATE = """
         setInterval(updateCountdown, 1000);
         // Initial update
         updateCountdown();
+
+        async function toggleScript(scriptName, action) {{
+            const response = await fetch(`/toggle?script=${{scriptName}}&action=${{action}}`, {{ method: 'POST' }});
+            if (response.ok) {{
+                location.reload();
+            }} else {{
+                alert('Failed to toggle script');
+            }}
+        }}
     </script>
 </body>
 </html>
@@ -174,11 +195,11 @@ async def run_script(script_name: str, input_value: int) -> None:
     logger.info(f"Starting {script_name} with input {input_value}, logging to {log_file}")
     
     script_status[script_name]["status"] = "Running"
-    script_status[script_name]["last_run"] = datetime.now(timezone.utc)  # Store as timezone-aware datetime
+    script_status[script_name]["last_run"] = datetime.now(timezone.utc)
     script_status[script_name]["last_input"] = input_value
     script_status[script_name]["last_error"] = None
     script_status[script_name]["last_log_file"] = log_file
-    script_status[script_name]["next_run"] = None  # Reset until scheduled
+    script_status[script_name]["next_run"] = None
 
     start_time = datetime.now(timezone.utc)
     try:
@@ -218,8 +239,8 @@ async def run_script(script_name: str, input_value: int) -> None:
         script_status[script_name]["last_error"] = str(e)
 
 async def script_runner(script_name: str) -> None:
-    """Run a script at random intervals with random inputs indefinitely."""
-    while True:
+    """Run a script at random intervals with random inputs until stopped."""
+    while script_status[script_name]["running"]:
         input_value = random.randint(1, 1000)  # Random natural number input (1 to 1000)
         delay = random.randint(30, 300)        # Random delay between 30 seconds and 5 minutes
 
@@ -227,10 +248,14 @@ async def script_runner(script_name: str) -> None:
         
         # Schedule next run and store timestamp
         next_run_time = datetime.now(timezone.utc) + timedelta(seconds=delay)
-        script_status[script_name]["next_run"] = next_run_time.timestamp()  # Unix timestamp in seconds
+        script_status[script_name]["next_run"] = next_run_time.timestamp()
         
         logger.info(f"{script_name} scheduled to run again in {delay} seconds")
         await asyncio.sleep(delay)
+    
+    logger.info(f"{script_name} stopped")
+    script_status[script_name]["status"] = "Stopped"
+    script_status[script_name]["next_run"] = None
 
 async def index_handler(request: web.Request) -> web.Response:
     """Handle HTTP GET requests to the root (/), returning the monitor interface."""
@@ -238,17 +263,24 @@ async def index_handler(request: web.Request) -> web.Response:
     for script_name, status in script_status.items():
         status_class = f"status-{status['status'].lower()}"
         log_link = f"<a href=\"/logs?file={status['last_log_file']}\">Download</a>" if status['last_log_file'] else "N/A"
-        next_run = status['next_run'] if status['next_run'] else 0  # Default to 0 if not set
+        next_run = status['next_run'] if status['next_run'] else 0
         
-        # Format last_run as human-readable with timezone (e.g., "March 23, 2025 06:00:59 UTC")
+        # Format last_run as human-readable with timezone
         last_run_str = (
             status['last_run'].strftime("%B %d, %Y %H:%M:%S %Z")
             if status['last_run'] else "N/A"
         )
         
+        # Start/Stop button
+        if status["running"]:
+            button = f"<button class=\"toggle-btn stop-btn\" onclick=\"toggleScript('{script_name}', 'stop')\">Stop</button>"
+        else:
+            button = f"<button class=\"toggle-btn start-btn\" onclick=\"toggleScript('{script_name}', 'start')\">Start</button>"
+        
         rows += (
             f"<tr>"
             f"<td>{script_name}</td>"
+            f"<td>{button}</td>"
             f"<td class=\"{status_class}\">{status['status']}</td>"
             f"<td>{last_run_str}</td>"
             f"<td>{status['last_input'] or 'N/A'}</td>"
@@ -274,17 +306,56 @@ async def log_handler(request: web.Request) -> web.Response:
         }
     )
 
+async def favicon_handler(request: web.Request) -> web.Response:
+    """Handle requests for favicon.ico."""
+    raise web.HTTPNotFound()
+
 async def status_handler(request: web.Request) -> web.Response:
     """Handle HTTP GET requests to /status, returning the current status as JSON."""
     return web.json_response(script_status)
+
+async def toggle_handler(request: web.Request) -> web.Response:
+    """Handle HTTP POST requests to /toggle to start or stop a script."""
+    script_name = request.query.get("script")
+    action = request.query.get("action")
+    
+    if script_name not in script_status:
+        raise web.HTTPBadRequest(text=f"Invalid script name: {script_name}")
+    
+    if action not in ["start", "stop"]:
+        raise web.HTTPBadRequest(text=f"Invalid action: {action}")
+    
+    if action == "start" and not script_status[script_name]["running"]:
+        logger.info(f"Starting {script_name}")
+        script_status[script_name]["running"] = True
+        script_status[script_name]["task"] = asyncio.create_task(script_runner(script_name))
+        return web.Response(text="Script started")
+    
+    if action == "stop" and script_status[script_name]["running"]:
+        logger.info(f"Stopping {script_name}")
+        script_status[script_name]["running"] = False
+        if script_status[script_name]["task"]:
+            script_status[script_name]["task"].cancel()
+            try:
+                await script_status[script_name]["task"]
+            except asyncio.CancelledError:
+                pass
+            script_status[script_name]["task"] = None
+        script_status[script_name]["status"] = "Stopped"
+        script_status[script_name]["next_run"] = None
+        return web.Response(text="Script stopped")
+    
+    return web.Response(text="No action taken")
 
 async def start_http_server() -> None:
     """Start an HTTP server on port 1212 to expose the monitor interface."""
     app = web.Application()
     app.add_routes([
         web.get('/', index_handler),
+        web.get('/favicon.ico', favicon_handler),
         web.get('/status', status_handler),
-        web.get('/logs', log_handler)
+        web.get('/logs', log_handler),
+        web.post('/toggle', toggle_handler)
     ])
     runner = web.AppRunner(app)
     await runner.setup()
@@ -293,7 +364,7 @@ async def start_http_server() -> None:
     logger.info("HTTP server started on port 1212")
 
 async def main() -> None:
-    """Main function to start the orchestrator and HTTP server."""
+    """Main function to start the HTTP server."""
     logger.info("Starting Data Generator Orchestrator")
 
     # Validate script presence
@@ -307,9 +378,9 @@ async def main() -> None:
     # Start HTTP server
     await start_http_server()
 
-    # Start script runners concurrently
-    tasks = [asyncio.create_task(script_runner(script)) for script in scripts]
-    await asyncio.gather(*tasks)
+    # Keep the event loop running
+    while True:
+        await asyncio.sleep(3600)  # Sleep to prevent tight loop
 
 if __name__ == "__main__":
     asyncio.run(main())

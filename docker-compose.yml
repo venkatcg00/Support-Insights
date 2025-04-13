@@ -1,128 +1,201 @@
 services:
   mysql:
-    image: mysql:latest
+    image: mysql:8.0
     container_name: mysql
     restart: always
     environment:
       MYSQL_ROOT_PASSWORD: ${PROJECT_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
       MYSQL_USER: ${PROJECT_USER}
       MYSQL_PASSWORD: ${PROJECT_PASSWORD}
     ports:
-      - "${DB_PORT}:${DB_PORT}"
+      - "3306:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./mysql-init:/docker-entrypoint-initdb.d
     networks:
       - data-network
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "${PROJECT_USER}", "-p${PROJECT_PASSWORD}"]
+      test: ["CMD", "mysql", "-h", "localhost", "-u", "${PROJECT_USER}", "-p${PROJECT_PASSWORD}", "-e", "SHOW DATABASES LIKE '${AIRFLOW_DB}';"]
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 10s
+      start_period: 20s
 
   mongodb:
-    image: mongo:latest
+    image: bitnami/mongodb:6.0
     container_name: mongodb
     restart: always
     environment:
-      MONGO_INITDB_ROOT_USERNAME: ${PROJECT_USER}
-      MONGO_INITDB_ROOT_PASSWORD: ${PROJECT_PASSWORD}
-      MONGO_INITDB_DATABASE: ${MONGO_DB}
+      MONGODB_ROOT_USER: ${PROJECT_USER}
+      MONGODB_ROOT_PASSWORD: ${PROJECT_PASSWORD}
+      MONGODB_DATABASE: ${MONGO_DB}
     ports:
-      - "${MONGO_PORT}:${MONGO_PORT}"
+      - "27017:27017"
     volumes:
-      - mongo_data:/data/db
+      - mongodb_data:/bitnami/mongodb
     networks:
       - data-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--host", "localhost", "--username", "${PROJECT_USER}", "--password", "${PROJECT_PASSWORD}", "--eval", "db.runCommand('ping').ok", "--quiet"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   zookeeper:
-    image: bitnami/zookeeper:latest
+    image: bitnami/zookeeper:3.9
     container_name: zookeeper
     restart: always
     environment:
-      - ALLOW_ANONYMOUS_LOGIN=yes
+      ZOO_PORT_NUMBER: 2181
+      ZOO_SERVER_ID: 1
+      ZOO_TICK_TIME: 2000
+      ALLOW_ANONYMOUS_LOGIN: "yes"
     ports:
       - "2181:2181"
     volumes:
       - zookeeper_data:/bitnami/zookeeper
+    mem_limit: 512m
+    mem_reservation: 256m
     networks:
       - data-network
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "-z", "localhost", "2181"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
   kafka:
-    image: bitnami/kafka:latest
+    image: bitnami/kafka:3.7
     container_name: kafka
     restart: always
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_CFG_LOG4J_ROOT_LOGLEVEL: DEBUG
     ports:
       - "9092:9092"
-      - "29092:29092"
-    environment:
-      - KAFKA_BROKER_ID=1
-      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://${KAFKA_BOOTSTRAP_SERVERS},PLAINTEXT_HOST://localhost:29092
-      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
-      - ALLOW_PLAINTEXT_LISTENER=yes
     volumes:
       - kafka_data:/bitnami/kafka
+    mem_limit: 1.5g
+    mem_reservation: 768m
     networks:
       - data-network
+    healthcheck:
+      test: ["CMD", "/opt/bitnami/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "kafka:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     restart: always
     depends_on:
-      - kafka
-    ports:
-      - "1234:8080"
+      kafka:
+        condition: service_healthy
     environment:
-      - KAFKA_CLUSTERS_0_NAME=local
-      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=${KAFKA_BOOTSTRAP_SERVERS}
-      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    ports:
+      - "8081:8080"
     networks:
       - data-network
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/api/clusters"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
   minio:
-    image: minio/minio
+    image: minio/minio:latest
     container_name: minio
     restart: always
-    ports:
-      - "${MINIO_PORT}:${MINIO_PORT}"
-      - "9001:9001"
     environment:
       MINIO_ROOT_USER: ${PROJECT_USER}
       MINIO_ROOT_PASSWORD: ${PROJECT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     command: server /data --console-address ":9001"
     volumes:
       - minio_data:/data
     networks:
       - data-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   airflow:
-    image: apache/airflow:latest
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
     container_name: airflow
     restart: always
+    depends_on:
+      mysql:
+        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: mysql+pymysql://${PROJECT_USER}:${PROJECT_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
-      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 30
-      AIRFLOW__CORE__DAG_SERIALIZATION: "True"
-      AIRFLOW__CORE__STORE_SERIALIZED_DAGS: "True"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: mysql+pymysql://${PROJECT_USER}:${PROJECT_PASSWORD}@${DB_HOST}:${DB_PORT}/${AIRFLOW_DB}
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+      AIRFLOW__LOGGING__LOGGING_LEVEL: DEBUG
       _AIRFLOW_WWW_USER_USERNAME: ${PROJECT_USER}
       _AIRFLOW_WWW_USER_PASSWORD: ${PROJECT_PASSWORD}
       _AIRFLOW_WWW_USER_FIRSTNAME: ${AIRFLOW_FIRSTNAME}
       _AIRFLOW_WWW_USER_LASTNAME: ${AIRFLOW_LASTNAME}
       _AIRFLOW_WWW_USER_EMAIL: ${AIRFLOW_EMAIL}
       _AIRFLOW_WWW_USER_ROLE: Admin
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    volumes:
+      - ./Data-Loaders/Batch-Processing:/opt/airflow/dags
+      - ./Data-Loaders/Stream-Processing:/opt/airflow/dags
+      - ./Data-Loaders/plugins:/opt/airflow/plugins
+      - ./Data-Loaders/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep '[t]ail -f /dev/null'"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  python-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.python-runner
+    container_name: python-runner
+    restart: always
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "1212:1212"
+    environment:
       DB_HOST: ${DB_HOST}
       DB_PORT: ${DB_PORT}
       DB_NAME: ${DB_NAME}
@@ -141,72 +214,26 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
       KAFKA_TOPIC_NAME: ${KAFKA_TOPIC_NAME}
     volumes:
-      - ./Data-Loaders/Batch-Processing:/opt/airflow/dags
-      - ./Data-Loaders/plugins:/opt/airflow/plugins
-      - airflow_logs:/opt/airflow/logs
-    networks:
-      - data-network
-    depends_on:
-      mysql:
-        condition: service_healthy
-    command: >
-      bash -c "
-      echo 'Initializing Airflow...' &&
-      airflow db init &&
-      pip install --no-cache-dir boto3 pandas kafka-python pymysql pymongo confluent-kafka pyspark --break-system-packages &&
-      airflow users create -u ${PROJECT_USER} -p ${PROJECT_PASSWORD} -f ${AIRFLOW_FIRSTNAME} -l ${AIRFLOW_LASTNAME} -r Admin -e ${AIRFLOW_EMAIL} &&
-      echo 'Airflow DB initialized and user created.' &&
-      airflow webserver & airflow scheduler
-      "
-
-  python-runner:
-    image: python:3.9-slim
-    container_name: python-runner
-    restart: always
-    ports:
-      - "1212:1212"
-    environment:
-      - DB_HOST=${DB_HOST}
-      - DB_PORT=${DB_PORT}
-      - DB_NAME=${DB_NAME}
-      - DB_USER=${PROJECT_USER}
-      - DB_PASSWORD=${PROJECT_PASSWORD}
-      - MONGO_HOST=${MONGO_HOST}
-      - MONGO_PORT=${MONGO_PORT}
-      - MONGO_USER=${PROJECT_USER}
-      - MONGO_PASSWORD=${PROJECT_PASSWORD}
-      - MONGO_DB=${MONGO_DB}
-      - MINIO_HOST=${MINIO_HOST}
-      - MINIO_PORT=${MINIO_PORT}
-      - MINIO_USER=${PROJECT_USER}
-      - MINIO_PASSWORD=${PROJECT_PASSWORD}
-      - MINIO_BUCKET=${MINIO_BUCKET}
-      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
-      - KAFKA_TOPIC_NAME=${KAFKA_TOPIC_NAME}
-    volumes:
       - ./Data-Generators:/app/scripts
       - python_runner_logs:/app/logs
     networks:
       - data-network
-    depends_on:
-      mysql:
-        condition: service_healthy
-    command: >
-      bash -c "
-      apt-get update && apt-get install -y netcat-openbsd && apt-get clean && rm -rf /var/lib/apt/lists/* &&
-      pip install --no-cache-dir pandas sqlalchemy pymysql kafka-python pymongo boto3 confluent-kafka aiohttp --break-system-packages &&
-      tail -f /dev/null
-      "
-
-networks:
-  data-network:
-    name: data-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:1212/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
 
 volumes:
   mysql_data:
-  mongo_data:
+  mongodb_data:
   minio_data:
-  kafka_data:
-  zookeeper_data:
   airflow_logs:
   python_runner_logs:
+  zookeeper_data:
+  kafka_data:
+
+networks:
+  data-network:
+    driver: bridge
