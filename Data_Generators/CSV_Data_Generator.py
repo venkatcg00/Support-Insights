@@ -2,13 +2,15 @@
 
 This script generates random support records based on allowed values from a MySQL database,
 fetches the latest CSV file from an S3 bucket (e.g., MinIO), updates records, and uploads
-the new dataset. It supports configurable record counts via command-line arguments and is
-designed to run under Data_Generator_Orchestrator.py with a log file specified via the
-SCRIPT_LOG_FILE environment variable. All configuration is sourced from environment variables.
+the new dataset with a filename like '<N>_AT&T_Data_<timestamp>.csv'. It counts existing
+files containing 'AT&T_Data' in their name to determine the next sequential number. It
+supports configurable record counts via command-line arguments and is designed to run
+under Data_Generator_Orchestrator.py with a log file specified via the SCRIPT_LOG_FILE
+environment variable. All configuration is sourced from environment variables.
 
 Example (run inside python-runner container):
     $ python /app/scripts/CSV_Data_Generator.py 1000
-    # Generates 1000 records and uploads them to the configured MinIO bucket.
+    # Generates 1000 records and uploads them to the configured MinIO bucket as '<N>_AT&T_Data_<timestamp>.csv'.
 """
 
 import argparse
@@ -69,16 +71,39 @@ def get_s3_client() -> boto3.client:
         logger.error("Failed to initialize S3 client: %s", str(e), exc_info=True)
         raise
 
-def get_latest_csv_file(s3_client: boto3.client, bucket_name: str) -> Tuple[Optional[str], Optional[BytesIO]]:
-    """Get the latest CSV file from the MinIO bucket."""
-    logger.debug("Fetching latest CSV file from bucket: %s", bucket_name)
+def get_file_count(s3_client: boto3.client, bucket_name: str) -> int:
+    """Count the number of files containing 'AT&T_Data' in their name in the MinIO bucket."""
+    logger.debug("Counting files containing 'AT&T_Data' in bucket: %s", bucket_name)
     try:
-        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix="AT&T_data_")
+        response = s3_client.list_objects_v2(Bucket=bucket_name)
         if "Contents" not in response or not response["Contents"]:
-            logger.warning("No files found with prefix 'AT&T_data_' in bucket: %s", bucket_name)
+            logger.info("No files found in bucket: %s", bucket_name)
+            return 0
+        file_count = len([obj for obj in response["Contents"] if "AT&T_Data" in obj["Key"]])
+        logger.info("Found %d files containing 'AT&T_Data' in bucket: %s", file_count, bucket_name)
+        return file_count
+    except ClientError as e:
+        logger.error("MinIO ClientError while counting files: %s", e.response["Error"]["Message"], exc_info=True)
+        return 0
+    except BotoCoreError as e:
+        logger.error("MinIO BotoCoreError while counting files: %s", str(e), exc_info=True)
+        return 0
+
+def get_latest_csv_file(s3_client: boto3.client, bucket_name: str) -> Tuple[Optional[str], Optional[BytesIO]]:
+    """Get the latest CSV file from the MinIO bucket containing 'AT&T_Data' in its name."""
+    logger.debug("Fetching latest CSV file containing 'AT&T_Data' from bucket: %s", bucket_name)
+    try:
+        response = s3_client.list_objects_v2(Bucket=bucket_name)
+        if "Contents" not in response or not response["Contents"]:
+            logger.warning("No files found in bucket: %s", bucket_name)
             return None, None
 
-        latest_object = max(response["Contents"], key=lambda x: x["LastModified"])
+        att_data_files = [obj for obj in response["Contents"] if "AT&T_Data" in obj["Key"]]
+        if not att_data_files:
+            logger.warning("No files found containing 'AT&T_Data' in bucket: %s", bucket_name)
+            return None, None
+
+        latest_object = max(att_data_files, key=lambda x: x["LastModified"])
         object_key = latest_object["Key"]
         logger.debug("Found latest file: %s", object_key)
 
@@ -161,15 +186,17 @@ def generate_and_update_records(
 def write_records_to_csv(
     s3_client: boto3.client,
     bucket_name: str,
-    data: List[List[Union[str, None]]]
+    data: List[List[Union[str, None]]],
+    file_count: int
 ) -> str:
-    """Write records to CSV and upload to MinIO with all fields quoted."""
+    """Write records to CSV and upload to MinIO with a sequential filename including timestamp."""
     headers = [
         "TICKET_IDENTIFIER", "SUPPORT_CATEGORY", "AGENT_NAME", "DATE_OF_CALL",
         "CALL_STATUS", "CALL_TYPE", "TYPE_OF_CUSTOMER", "DURATION", "WORK_TIME",
         "TICKET_STATUS", "RESOLVED_IN_FIRST_CONTACT", "RESOLUTION_CATEGORY", "RATING"
     ]
-    file_name = f"AT&T_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    next_file_number = file_count + 1
+    file_name = f"{next_file_number}_AT&T_Data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     csv_buffer = StringIO()
     writer = csv.writer(csv_buffer, delimiter="|", quoting=csv.QUOTE_ALL)
     writer.writerow(headers)
@@ -189,7 +216,7 @@ def write_records_to_csv(
         raise
 
 def main() -> None:
-    """Main function to generate and upload random AT&T support records."""
+    """Main function to generate and upload random AT&T support records with sequential filenames."""
     logger.info("Starting data generation process")
 
     # Fetch configuration from environment variables
@@ -249,6 +276,7 @@ def main() -> None:
     # Initialize S3 client and fetch latest file
     try:
         s3_client = get_s3_client()
+        file_count = get_file_count(s3_client, minio_bucket)
         file_key, file_content = get_latest_csv_file(s3_client, minio_bucket)
         max_record_id = get_max_record_id(file_content, "TICKET_IDENTIFIER")
     except Exception as e:
@@ -276,7 +304,7 @@ def main() -> None:
         records = generate_and_update_records(
             support_categories, agent_pseudo_names, customer_types, max_record_id, num_records
         )
-        file_name = write_records_to_csv(s3_client, minio_bucket, records)
+        file_name = write_records_to_csv(s3_client, minio_bucket, records, file_count)
         logger.info("Data generation complete. File uploaded: %s/%s", minio_bucket, file_name)
     except Exception as e:
         logger.error("Failed to generate or upload records: %s", str(e), exc_info=True)

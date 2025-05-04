@@ -2,10 +2,10 @@
 
 # Script: deploy.sh
 # Description: Initializes and monitors a Docker Compose-based data pipeline with Airflow, Kafka,
-#              MySQL, MongoDB, MinIO, and other services. Ensures idempotency for safe re-runs.
+#              MySQL, MongoDB, MinIO and other services. Ensures idempotency for safe re-runs.
 # Author: Venkat CG
 # Date: April 13, 2025
-# Usage: ./setup_project.sh
+# Usage: ./deploy.sh
 # Prerequisites:
 #   - Docker and Docker Compose installed
 #   - .env file with required variables (PROJECT_USER, PROJECT_PASSWORD, etc.)
@@ -18,11 +18,11 @@
 set -euo pipefail
 
 # Configuration
-readonly COMPOSE_FILE="docker-compose.yml"
+readonly COMPOSE_FILE="docker_compose.yml"
 readonly TIMEOUT=1200          # Timeout for container health checks (seconds)
 readonly CHECK_INTERVAL=5      # Interval between health checks (seconds)
 readonly MAX_RESTARTS=3        # Maximum container restarts before failure
-readonly AIRFLOW_DAG_ID="process_csv_dag"
+readonly AIRFLOW_DAG_ID="minio_listener_dag"  # Updated DAG ID
 readonly CONTAINERS=(
     "mysql"
     "mongodb"
@@ -58,12 +58,24 @@ load_env() {
     # Filter comments and format key=value pairs
     source <(grep -v '^\s*#' .env | sed -E 's/^\s*(.+)\s*=\s*(.+)\s*$/\1="\2"/')
     set +a
+    # Validate critical environment variables
+    for var in PROJECT_USER PROJECT_PASSWORD; do
+        if [[ -z "${!var}" ]]; then
+            log "Environment variable ${var} is not set in .env file." "$RED"
+            exit 1
+        fi
+    done
     log "Environment variables loaded successfully." "$GREEN"
 }
 
 # Check if Docker Compose services are running
 check_compose() {
     docker-compose -f "$COMPOSE_FILE" ps --services --filter "status=running" | grep -q .
+}
+
+# Check if Docker Compose services exist but are stopped
+check_stopped_compose() {
+    docker-compose -f "$COMPOSE_FILE" ps --services --filter "status=exited" | grep -q .
 }
 
 # Get container status
@@ -123,18 +135,31 @@ start_compose() {
     if check_compose; then
         log "Docker Compose services are already running." "$GREEN"
         return 0
+    elif check_stopped_compose; then
+        log "Detected stopped Docker Compose services. Starting them..." "$YELLOW"
+        if ! docker-compose -f "$COMPOSE_FILE" start; then
+            log "Failed to start existing Docker Compose services." "$RED"
+            for container in "${CONTAINERS[@]}"; do
+                log "Status for ${container}: $(get_container_status "$container")" "$RED"
+                log "Health for ${container}: $(get_container_health "$container")" "$RED"
+                log "Logs for ${container}:\n$(get_container_logs "$container")" "$RED"
+            done
+            exit 1
+        fi
+        log "Stopped Docker Compose services started successfully." "$GREEN"
+    else
+        log "Starting Docker Compose services..." "$YELLOW"
+        if ! docker-compose -f "$COMPOSE_FILE" up -d --build; then
+            log "Failed to start Docker Compose." "$RED"
+            for container in "${CONTAINERS[@]}"; do
+                log "Status for ${container}: $(get_container_status "$container")" "$RED"
+                log "Health for ${container}: $(get_container_health "$container")" "$RED"
+                log "Logs for ${container}:\n$(get_container_logs "$container")" "$RED"
+            done
+            exit 1
+        fi
+        log "Docker Compose started successfully." "$GREEN"
     fi
-    log "Starting Docker Compose services..." "$YELLOW"
-    if ! docker-compose -f "$COMPOSE_FILE" up -d --build; then
-        log "Failed to start Docker Compose." "$RED"
-        for container in "${CONTAINERS[@]}"; do
-            log "Status for ${container}: $(get_container_status "$container")" "$RED"
-            log "Health for ${container}: $(get_container_health "$container")" "$RED"
-            log "Logs for ${container}:\n$(get_container_logs "$container")" "$RED"
-        done
-        exit 1
-    fi
-    log "Docker Compose started successfully." "$GREEN"
 }
 
 # Monitor container health
@@ -183,7 +208,9 @@ monitor_containers() {
                 healthy_containers+=("$container")
             else
                 all_healthy=false
-                [[ "$health" != "no_health" ]] && log "Container ${container} not healthy (health: ${health})." "$YELLOW"
+                if [[ "$health" != "no_health" ]]; then
+                    log "Container ${container} not healthy (health: ${health})." "$YELLOW"
+                fi
             fi
         done
 
@@ -199,7 +226,9 @@ monitor_containers() {
         local health
         health=$(get_container_health "$container")
         log "Final health for ${container}: ${health}" "$RED"
-        [[ "$health" != "healthy" && "$health" != "no_health" ]] && log "Logs for ${container}:\n$(get_container_logs "$container")" "$RED"
+        if [[ "$health" != "healthy" && "$health" != "no_health" ]]; then
+            log "Logs for ${container}:\n$(get_container_logs "$container")" "$RED"
+        fi
     done
     cleanup
     exit 1
@@ -404,6 +433,21 @@ add_airflow_connections() {
         log "MinIO connection added." "$GREEN"
     fi
 
+    # MinIO Bucket Variable
+    log "Adding MinIO bucket variable..." "$YELLOW"
+    if docker exec airflow airflow variables get minio_bucket >/dev/null 2>&1; then
+        log "MinIO bucket variable already exists." "$GREEN"
+    else
+        if ! docker exec airflow bash -c "
+            airflow variables set 'minio_bucket' '${MINIO_BUCKET}' >/dev/null 2>&1"; then
+            log "Failed to add MinIO bucket variable." "$RED"
+            log "Airflow logs:\n$(get_container_logs airflow)" "$RED"
+            cleanup
+            exit 1
+        fi
+        log "MinIO bucket variable added." "$GREEN"
+    fi
+
     # Kafka connection
     log "Adding Kafka connection..." "$YELLOW"
     if docker exec airflow airflow connections get kafka_project_connection >/dev/null 2>&1; then
@@ -443,43 +487,62 @@ verify_airflow_health() {
     exit 1
 }
 
-# Setup MinIO bucket and notifications
+# Setup MinIO bucket
 setup_minio() {
     log "Setting up MinIO bucket and notifications..." "$YELLOW"
+
+    log "Setting MinIO alias and creating bucket '${MINIO_BUCKET}'..." "$YELLOW"
     if ! docker exec -t minio bash -c "
-        # Set alias
-        mc alias set local http://localhost:9000 '${PROJECT_USER}' '${PROJECT_PASSWORD}' >/dev/null 2>&1 &&
-        # Create bucket
-        mc mb local/'${MINIO_BUCKET}' --ignore-existing >/dev/null 2>&1 &&
-        # Check and set webhook
-        webhook_configured=false
-        if mc admin config get local notify_webhook >/tmp/notify_webhook.txt 2>/dev/null; then
-            if cat /tmp/notify_webhook.txt | while read -r line; do [[ \$line == *'http://airflow:8080/api/v1/dags/minio_listener_dag/dagRuns'* ]] && exit 0; done; then
-                webhook_configured=true
-            fi
-        fi
-        if [ \"\$webhook_configured\" = false ]; then
-            mc admin config set local notify_webhook:webhook endpoint='http://airflow:8080/api/v1/dags/minio_listener_dag/dagRuns' >/dev/null 2>&1 &&
-            mc admin service restart local >/dev/null 2>&1 &&
-            sleep 10
-        fi &&
-        # Check and set bucket event
-        event_configured=false
-        if mc event list local/'${MINIO_BUCKET}' >/tmp/event_list.txt 2>/dev/null; then
-            if cat /tmp/event_list.txt | while read -r line; do [[ \$line == *'webhook'* ]] && exit 0; done; then
-                event_configured=true
-            fi
-        fi
-        if [ \"\$event_configured\" = false ]; then
-            mc event add local/'${MINIO_BUCKET}' arn:minio:sqs::webhook:webhook --event put --suffix '.csv' --prefix '*_AT&T_Data_*' >/dev/null 2>&1
-        fi &&
-        rm -f /tmp/notify_webhook.txt /tmp/event_list.txt 2>/dev/null"; then
-        log "Failed to set up MinIO bucket or notifications." "$RED"
+        mc --no-color alias set local http://localhost:9000 '${PROJECT_USER}' '${PROJECT_PASSWORD}' 2>/dev/null &&
+        mc --no-color mb local/'${MINIO_BUCKET}' --ignore-existing 2>/dev/null"; then
+        log "Failed to set alias or create bucket." "$RED"
         log "MinIO logs:\n$(get_container_logs minio)" "$RED"
         cleanup
         exit 1
     fi
-    log "MinIO bucket and notifications configured." "$GREEN"
+    log "MinIO bucket '${MINIO_BUCKET}' created." "$GREEN"
+}
+
+# Prompt user to exit or stop containers
+prompt_user_action() {
+    log "All services are running. What would you like to do?" "$YELLOW"
+    echo "1) Exit the script (keep containers running)"
+    echo "2) Stop Docker containers"
+    local choice
+    read -p "Enter your choice (1 or 2): " choice
+    choice=$(echo "$choice" | tr -d '[:space:]')  # Trim whitespace and newlines
+
+    case "$choice" in
+        1)
+            log "Exiting script. Containers are still running." "$GREEN"
+            exit 0
+            ;;
+        2)
+            log "Stopping Docker containers..." "$YELLOW"
+            cleanup
+            log "Containers stopped. Exiting script." "$GREEN"
+            exit 0
+            ;;
+        *)
+            log "Invalid choice. Please enter 1 or 2." "$RED"
+            prompt_user_action  # Retry on invalid input
+            ;;
+    esac
+}
+
+# Check existing connections and health
+check_existing_setup() {
+    log "Checking existing setup..." "$YELLOW"
+    
+    # Start containers if stopped
+    start_compose
+    
+    # Monitor container health
+    monitor_containers
+    
+    # Verify connections
+    initialize_airflow
+    verify_airflow_health
 }
 
 # Main execution
@@ -490,21 +553,30 @@ main() {
     # Load environment variables
     load_env
 
-    # Start Docker Compose
-    start_compose
+    # Check if containers exist but are stopped
+    if check_stopped_compose; then
+        log "Detected stopped containers. Verifying existing setup..." "$YELLOW"
+        check_existing_setup
+    else
+        # Start Docker Compose
+        start_compose
 
-    # Monitor containers
-    monitor_containers
+        # Monitor containers
+        monitor_containers
 
-    # Initialize services
-    verify_mysql
-    create_kafka_topic
-    initialize_airflow
-    add_airflow_connections
-    verify_airflow_health
-    setup_minio
+        # Initialize services
+        verify_mysql
+        create_kafka_topic
+        initialize_airflow
+        add_airflow_connections
+        verify_airflow_health
+        setup_minio
+    fi
 
     log "All services initialized successfully!" "$GREEN"
+
+    # Prompt user for next action
+    prompt_user_action
 }
 
 # Run main function

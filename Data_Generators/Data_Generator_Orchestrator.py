@@ -1,17 +1,3 @@
-"""
-Parent script to orchestrate execution of data generator scripts with manual control.
-
-This script runs an HTTP server on port 1212 with a web interface resembling an Informatica Workflow Monitor,
-showing script status, run details, countdown to next run, and links to download log files.
-Each script (CSV_Data_Generator.py, JSON_Data_Generator.py, XML_Data_Generator.py) has a start/stop toggle button.
-When started, scripts run asynchronously with random inputs and delays. When stopped, execution halts.
-
-Example (run inside python-runner container):
-    $ python /app/scripts/Data_Generator_Orchestrator.py
-    # Starts the HTTP server.
-    # Access monitor: http://localhost:1212/
-"""
-
 import asyncio
 import random
 import logging
@@ -20,8 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 from aiohttp import web
 import os
-import json
-import sys
+import threading
 
 # Dynamic log file name with timestamp, stored in mounted volume
 log_file_name = f"/app/logs/Data_Generator_Orchestrator_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
@@ -32,10 +17,13 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(log_file_name),
-        logging.StreamHandler()  # Also log to console
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Thread lock for safe status updates
+status_lock = threading.Lock()
 
 # Global status dictionary to track script execution
 script_status: Dict[str, Dict[str, Any]] = {
@@ -45,10 +33,10 @@ script_status: Dict[str, Dict[str, Any]] = {
         "status": "Stopped",
         "last_error": None,
         "last_log_file": None,
-        "last_duration": None,  # Duration in seconds
-        "next_run": None,       # Timestamp of next scheduled run
-        "running": False,       # Tracks if the script is actively running
-        "task": None            # Stores asyncio Task for cancellation
+        "last_duration": None,
+        "next_run": None,
+        "running": False,
+        "task": None
     },
     "JSON_Data_Generator": {
         "last_run": None,
@@ -71,10 +59,22 @@ script_status: Dict[str, Dict[str, Any]] = {
         "next_run": None,
         "running": False,
         "task": None
+    },
+    "Kafka_Stream_Processing": {
+        "last_run": None,
+        "last_input": "NA",
+        "status": "Stopped",
+        "last_error": None,
+        "last_log_file": None,
+        "last_duration": "NA",
+        "next_run": "NA",
+        "running": False,
+        "thread": None,
+        "process": None
     }
 }
 
-# HTML template with escaped curly braces and start/stop toggle buttons
+# HTML template with escaped curly braces for CSS
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -83,66 +83,23 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Data Generator Workflow Monitor</title>
     <style>
-        body {{
-            font-family: Arial, sans-serif;
-            margin: 20px;
-            background-color: #f5f5f5;
-        }}
-        h1 {{
-            color: #333;
-            text-align: center;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-            background-color: #fff;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }}
-        th, td {{
-            padding: 10px;
-            text-align: left;
-            border: 1px solid #ddd;
-        }}
-        th {{
-            background-color: #4CAF50;
-            color: white;
-        }}
-        tr:nth-child(even) {{
-            background-color: #f9f9f9;
-        }}
-        tr:hover {{
-            background-color: #f1f1f1;
-        }}
+        body {{ font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }}
+        h1 {{ color: #333; text-align: center; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; background-color: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+        th, td {{ padding: 10px; text-align: left; border: 1px solid #ddd; }}
+        th {{ background-color: #4CAF50; color: white; }}
+        tr:nth-child(even) {{ background-color: #f9f9f9; }}
+        tr:hover {{ background-color: #f1f1f1; }}
         .status-running {{ color: #FFA500; }}
         .status-completed {{ color: #008000; }}
         .status-failed {{ color: #FF0000; }}
         .status-stopped {{ color: #808080; }}
-        a {{
-            color: #0066cc;
-            text-decoration: none;
-        }}
-        a:hover {{
-            text-decoration: underline;
-        }}
-        .toggle-btn {{
-            padding: 5px 10px;
-            border: none;
-            cursor: pointer;
-            font-size: 14px;
-            border-radius: 4px;
-        }}
-        .start-btn {{
-            background-color: #4CAF50;
-            color: white;
-        }}
-        .stop-btn {{
-            background-color: #FF0000;
-            color: white;
-        }}
-        .toggle-btn:hover {{
-            opacity: 0.9;
-        }}
+        a {{ color: #0066cc; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+        .toggle-btn {{ padding: 5px 10px; border: none; cursor: pointer; font-size: 14px; border-radius: 4px; }}
+        .start-btn {{ background-color: #4CAF50; color: white; }}
+        .stop-btn {{ background-color: #FF0000; color: white; }}
+        .toggle-btn:hover {{ opacity: 0.9; }}
     </style>
 </head>
 <body>
@@ -163,16 +120,14 @@ HTML_TEMPLATE = """
     </table>
     <script>
         function updateCountdown() {{
-            const now = new Date().getTime() / 1000; // Current time in seconds
+            const now = new Date().getTime() / 1000;
             document.querySelectorAll('.countdown').forEach(cell => {{
                 const nextRun = parseFloat(cell.getAttribute('data-next-run'));
-                const secondsLeft = Math.max(0, Math.round(nextRun - now));
-                cell.textContent = secondsLeft > 0 ? secondsLeft : 'N/A';
+                const secondsLeft = isNaN(nextRun) ? 'N/A' : Math.max(0, Math.round(nextRun - now));
+                cell.textContent = secondsLeft;
             }});
         }}
-        // Update countdown every second
         setInterval(updateCountdown, 1000);
-        // Initial update
         updateCountdown();
 
         async function toggleScript(scriptName, action) {{
@@ -194,12 +149,13 @@ async def run_script(script_name: str, input_value: int) -> None:
     log_file = f"/app/logs/{script_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
     logger.info(f"Starting {script_name} with input {input_value}, logging to {log_file}")
     
-    script_status[script_name]["status"] = "Running"
-    script_status[script_name]["last_run"] = datetime.now(timezone.utc)
-    script_status[script_name]["last_input"] = input_value
-    script_status[script_name]["last_error"] = None
-    script_status[script_name]["last_log_file"] = log_file
-    script_status[script_name]["next_run"] = None
+    with status_lock:
+        script_status[script_name]["status"] = "Running"
+        script_status[script_name]["last_run"] = datetime.now(timezone.utc)
+        script_status[script_name]["last_input"] = input_value
+        script_status[script_name]["last_error"] = None
+        script_status[script_name]["last_log_file"] = log_file
+        script_status[script_name]["next_run"] = None
 
     start_time = datetime.now(timezone.utc)
     try:
@@ -221,41 +177,97 @@ async def run_script(script_name: str, input_value: int) -> None:
         stdout, stderr = await process.communicate()
         
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
-        script_status[script_name]["last_duration"] = round(duration, 2)
+        with status_lock:
+            script_status[script_name]["last_duration"] = round(duration, 2)
 
         if process.returncode == 0:
             logger.info(f"{script_name} completed successfully in {duration:.2f} seconds")
-            script_status[script_name]["status"] = "Completed"
+            with status_lock:
+                script_status[script_name]["status"] = "Completed"
         else:
             error_msg = stderr.decode().strip()
             logger.error(f"{script_name} failed with error: {error_msg}")
-            script_status[script_name]["status"] = "Failed"
-            script_status[script_name]["last_error"] = error_msg
+            with status_lock:
+                script_status[script_name]["status"] = "Failed"
+                script_status[script_name]["last_error"] = error_msg
     except Exception as e:
         duration = (datetime.now(timezone.utc) - start_time).total_seconds()
-        script_status[script_name]["last_duration"] = round(duration, 2)
-        logger.error(f"Exception while running {script_name}: {str(e)}", exc_info=True)
-        script_status[script_name]["status"] = "Failed"
-        script_status[script_name]["last_error"] = str(e)
+        with status_lock:
+            script_status[script_name]["last_duration"] = round(duration, 2)
+            logger.error(f"Exception while running {script_name}: {str(e)}")
+            script_status[script_name]["status"] = "Failed"
+            script_status[script_name]["last_error"] = str(e)
+
+def run_Kafka_Stream_Processing(script_name: str) -> None:
+    """Run Kafka_Stream_Processing script in a separate thread."""
+    script_path = f"/app/scripts/{script_name}.py"
+    log_file = f"/app/logs/{script_name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+    logger.info(f"Starting {script_name}, logging to {log_file}")
+    
+    with status_lock:
+        script_status[script_name]["status"] = "Running"
+        script_status[script_name]["last_run"] = datetime.now(timezone.utc)
+        script_status[script_name]["last_error"] = None
+        script_status[script_name]["last_log_file"] = log_file
+
+    try:
+        env = os.environ.copy()
+        env["SCRIPT_LOG_FILE"] = log_file
+        for var in ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD",
+                    "KAFKA_BOOTSTRAP_SERVERS", "KAFKA_TOPIC_NAME"]:
+            if var in os.environ:
+                env[var] = os.environ[var]
+
+        process = subprocess.Popen(
+            ["python", script_path],
+            env=env,
+            stdout=open(log_file, "a"),
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        with status_lock:
+            script_status[script_name]["process"] = process
+        
+        return_code = process.wait()
+        
+        with status_lock:
+            if return_code != 0:
+                logger.error(f"{script_name} exited with code {return_code}")
+                script_status[script_name]["status"] = "Failed"
+                script_status[script_name]["last_error"] = f"Exited with code {return_code}"
+            else:
+                logger.info(f"{script_name} completed unexpectedly")
+                script_status[script_name]["status"] = "Stopped"
+    except Exception as e:
+        logger.error(f"Exception while running {script_name}: {str(e)}")
+        with status_lock:
+            script_status[script_name]["status"] = "Failed"
+            script_status[script_name]["last_error"] = str(e)
+    finally:
+        with status_lock:
+            script_status[script_name]["running"] = False
+            script_status[script_name]["process"] = None
+            script_status[script_name]["thread"] = None
 
 async def script_runner(script_name: str) -> None:
     """Run a script at random intervals with random inputs until stopped."""
     while script_status[script_name]["running"]:
-        input_value = random.randint(1, 1000)  # Random natural number input (1 to 1000)
-        delay = random.randint(30, 300)        # Random delay between 30 seconds and 5 minutes
+        input_value = random.randint(100, 100_000)
+        delay = random.randint(30, 300)
 
         await run_script(script_name, input_value)
         
-        # Schedule next run and store timestamp
-        next_run_time = datetime.now(timezone.utc) + timedelta(seconds=delay)
-        script_status[script_name]["next_run"] = next_run_time.timestamp()
+        with status_lock:
+            next_run_time = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            script_status[script_name]["next_run"] = next_run_time.timestamp()
         
         logger.info(f"{script_name} scheduled to run again in {delay} seconds")
         await asyncio.sleep(delay)
     
     logger.info(f"{script_name} stopped")
-    script_status[script_name]["status"] = "Stopped"
-    script_status[script_name]["next_run"] = None
+    with status_lock:
+        script_status[script_name]["status"] = "Stopped"
+        script_status[script_name]["next_run"] = None
 
 async def index_handler(request: web.Request) -> web.Response:
     """Handle HTTP GET requests to the root (/), returning the monitor interface."""
@@ -263,15 +275,13 @@ async def index_handler(request: web.Request) -> web.Response:
     for script_name, status in script_status.items():
         status_class = f"status-{status['status'].lower()}"
         log_link = f"<a href=\"/logs?file={status['last_log_file']}\">Download</a>" if status['last_log_file'] else "N/A"
-        next_run = status['next_run'] if status['next_run'] else 0
+        next_run = status['next_run'] if status['next_run'] != "NA" else 0
         
-        # Format last_run as human-readable with timezone
         last_run_str = (
             status['last_run'].strftime("%B %d, %Y %H:%M:%S %Z")
             if status['last_run'] else "N/A"
         )
         
-        # Start/Stop button
         if status["running"]:
             button = f"<button class=\"toggle-btn stop-btn\" onclick=\"toggleScript('{script_name}', 'stop')\">Stop</button>"
         else:
@@ -283,9 +293,9 @@ async def index_handler(request: web.Request) -> web.Response:
             f"<td>{button}</td>"
             f"<td class=\"{status_class}\">{status['status']}</td>"
             f"<td>{last_run_str}</td>"
-            f"<td>{status['last_input'] or 'N/A'}</td>"
-            f"<td>{status['last_duration'] or 'N/A'}</td>"
-            f"<td class=\"countdown\" data-next-run=\"{next_run}\">N/A</td>"
+            f"<td>{status['last_input']}</td>"
+            f"<td>{status['last_duration']}</td>"
+            f"<td class=\"countdown\" data-next-run=\"{next_run}\">{status['next_run']}</td>"
             f"<td>{status['last_error'] or 'None'}</td>"
             f"<td>{log_link}</td>"
             f"</tr>"
@@ -325,25 +335,45 @@ async def toggle_handler(request: web.Request) -> web.Response:
     if action not in ["start", "stop"]:
         raise web.HTTPBadRequest(text=f"Invalid action: {action}")
     
-    if action == "start" and not script_status[script_name]["running"]:
-        logger.info(f"Starting {script_name}")
-        script_status[script_name]["running"] = True
-        script_status[script_name]["task"] = asyncio.create_task(script_runner(script_name))
-        return web.Response(text="Script started")
-    
-    if action == "stop" and script_status[script_name]["running"]:
-        logger.info(f"Stopping {script_name}")
-        script_status[script_name]["running"] = False
-        if script_status[script_name]["task"]:
-            script_status[script_name]["task"].cancel()
-            try:
-                await script_status[script_name]["task"]
-            except asyncio.CancelledError:
-                pass
-            script_status[script_name]["task"] = None
-        script_status[script_name]["status"] = "Stopped"
-        script_status[script_name]["next_run"] = None
-        return web.Response(text="Script stopped")
+    with status_lock:
+        if action == "start" and not script_status[script_name]["running"]:
+            logger.info(f"Starting {script_name}")
+            script_status[script_name]["running"] = True
+            if script_name == "Kafka_Stream_Processing":
+                # Start Kafka_Stream_Processing in a separate thread
+                thread = threading.Thread(target=run_Kafka_Stream_Processing, args=(script_name,))
+                thread.start()
+                script_status[script_name]["thread"] = thread
+            else:
+                # Start other scripts as asyncio tasks
+                script_status[script_name]["task"] = asyncio.create_task(script_runner(script_name))
+            return web.Response(text="Script started")
+        
+        if action == "stop" and script_status[script_name]["running"]:
+            logger.info(f"Stopping {script_name}")
+            script_status[script_name]["running"] = False
+            if script_name == "Kafka_Stream_Processing" and script_status[script_name]["process"]:
+                # Terminate Kafka_Stream_Processing process
+                script_status[script_name]["process"].terminate()
+                try:
+                    script_status[script_name]["process"].wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    script_status[script_name]["process"].kill()
+                script_status[script_name]["process"] = None
+                # Thread will exit after process terminates
+                if script_status[script_name]["thread"]:
+                    script_status[script_name]["thread"].join(timeout=5)
+                    script_status[script_name]["thread"] = None
+            if script_status[script_name]["task"]:
+                script_status[script_name]["task"].cancel()
+                try:
+                    await script_status[script_name]["task"]
+                except asyncio.CancelledError:
+                    pass
+                script_status[script_name]["task"] = None
+            script_status[script_name]["status"] = "Stopped"
+            script_status[script_name]["next_run"] = "NA" if script_name == "Kafka_Stream_Processing" else None
+            return web.Response(text="Script stopped")
     
     return web.Response(text="No action taken")
 
@@ -368,19 +398,23 @@ async def main() -> None:
     logger.info("Starting Data Generator Orchestrator")
 
     # Validate script presence
-    scripts = ["CSV_Data_Generator", "JSON_Data_Generator", "XML_Data_Generator"]
+    scripts = ["CSV_Data_Generator", "JSON_Data_Generator", "XML_Data_Generator", "Kafka_Stream_Processing"]
     for script in scripts:
         script_path = f"/app/scripts/{script}.py"
         if not os.path.exists(script_path):
-            logger.error(f"Script {script_path} not found")
-            sys.exit(1)
+            logger.warning(f"Script {script_path} not found, skipping")
+            with status_lock:
+                script_status[script]["status"] = "Not Found"
+                script_status[script]["last_error"] = "Script file missing"
+        else:
+            logger.info(f"Found script: {script_path}")
 
     # Start HTTP server
     await start_http_server()
 
     # Keep the event loop running
     while True:
-        await asyncio.sleep(3600)  # Sleep to prevent tight loop
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())

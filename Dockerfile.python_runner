@@ -1,0 +1,29 @@
+FROM python:3.9
+
+# Install OpenJDK 11 and other dependencies
+RUN apt-get update && \
+    apt-get install -y openjdk-17-jdk netcat-openbsd curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Set JAVA_HOME and update PATH
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    pandas \
+    sqlalchemy \
+    pymysql \
+    pymongo \
+    boto3 \
+    aiohttp \
+    pyspark==3.5.0 \
+    minio \
+    psutil \
+    requests \
+    confluent-kafka 
+
+WORKDIR /app
+
+# Run orchestrator on container start
+CMD ["python", "/app/scripts/Data_Generator_Orchestrator.py"]
